@@ -54,6 +54,10 @@ enum OpType
     NOP = 0,        /* No Operation */
     ACTIVATE,       /* a.k.a. RAS */
     SHIFT,          /* only used in Racetrack memory also known as Domain Wall Memory*/
+    INSERT,         /* only used in Skyrmion Racetrack memory */
+    DELETE,         /* only used in Skyrmion Racetrack memory */
+    PARALLEL,              /* parallel+ write to Skyrmion racetrack memory*/
+    LIM,
     READ,           /* a.k.a. CAS-R */ 
     READ_PRECHARGE, /* CAS-R with implicit PRECHARGE */ 
     WRITE,          /* a.k.a. CAS-W */  

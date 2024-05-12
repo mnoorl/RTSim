@@ -56,6 +56,7 @@
 #include <cassert>
 #include <iostream>
 #include <limits>
+#include <cmath>
 
 /*
  * Using -O3 in gcc causes the popcount methods to return incorrect values.
@@ -127,6 +128,8 @@ SubArray::SubArray( )
     reads = 0;
     writes = 0;
     shiftReqs = 0;
+    insertReqs = 0;
+    deleteReqs = 0;
     activates = 0;
     precharges = 0;
     refreshes = 0;
@@ -292,7 +295,17 @@ void SubArray::RegisterStats( )
         AddStat(shiftReqs);
         AddUnitStat(shiftEnergy, "nJ");
         AddStat(totalnumShifts);
-    }
+        AddStat(insertReqs);
+        AddStat(deleteReqs);
+        if (p->MemIsSK)
+        {
+            AddStat(numParallelShifts);
+            AddStat(numSkyrmionCreated);
+            AddStat(numSkyrmionDestroyed);
+            AddStat(limReqs);
+            AddStat(totalNumLims);
+        }        
+    }    
     else
     {
         if( endrModel )
@@ -453,14 +466,23 @@ bool SubArray::Read( NVMainRequest *request )
         std::cerr << "NVMain Error: try to read a row that is not opened in a subarray!"
             << std::endl;
         return false;
-    }
-    
+    }    
+
     /************************ONLY FOR RTM***************************
      * Before accessing the subarray, perform the shifting operation
      * to align port position to the requested data and incur 
      * latency and energy !.
      ***************************************************************/
     
+    if ( p->MemIsSK ) {
+        if ( p->WordBasedMapping) {
+            // Track is word-based, so wordsize is within one track.
+            ncounter_t numShifts = 0;
+            numShifts += wordSize * 2; //Shift bit by bit to write data, then back to stay word aligned
+            totalnumShifts += numShifts;                
+        }
+    }
+
 //     if( !Shift( readDBC, readDomain ) )
 //         std::cout<<"Subarray: Shift function has returned error. !!"<<std::endl;
     
@@ -609,7 +631,6 @@ bool SubArray::Write( NVMainRequest *request )
         return false;
     }
     
-    
     /************************ONLY FOR RTM***************************
      * Before accessing the subarray, perform the shifting operation
      * to align port position to the requested data and incur 
@@ -620,7 +641,7 @@ bool SubArray::Write( NVMainRequest *request )
 //         std::cout<<"Subarray: Shift function has returned error. !!"<<std::endl;
     
     if( writeMode == WRITE_THROUGH )
-    {
+    {       
         encLat = (dataEncoder ? dataEncoder->Write( request ) : 0);
         endrLat = UpdateEndurance( request );
 
@@ -641,6 +662,35 @@ bool SubArray::Write( NVMainRequest *request )
 
             assert( request->data.GetSize()*8 >= numChangedBits );
             numUnchangedBits = request->data.GetSize()*8 - numChangedBits;
+        }
+
+        if ( p->MemIsSK)
+        {
+            // Determine number of skyrmions created/deleted during writing
+            // Assume wordsize in bits, so shift through wordsize bits of old and new request            
+
+            if ( p->WordBasedMapping) {
+                // Track is word-based, so wordsize is within one track.
+                ncounter_t numShifts = 0;
+                numShifts += wordSize * 2; //Shift bit by bit to write data, then back to stay word aligned
+                totalnumShifts += numShifts;                
+            }
+
+            for (uint32_t bit = 0; bit < wordSize; bit++) {
+                bool after = request->data.GetByte(bit / 8) & (0b1 << (bit % 8));
+                bool before = request->oldData.GetByte(bit / 8) & (0b1 << (bit % 8));
+
+                if (after && !before) 
+                {
+                    // If skyrmion will be written and no exists before
+                    numSkyrmionCreated++;
+                } 
+                else if(!after && before) 
+                {                    
+                    // If no skyrmion written, but one exists before
+                    numSkyrmionDestroyed++;
+                }
+            }            
         }
     }
 
@@ -801,7 +851,7 @@ bool SubArray::Write( NVMainRequest *request )
 bool SubArray::Shift( NVMainRequest *request )
 {
     uint64_t dbc, dom;
-    request->address.GetTranslatedAddress( &dbc, &dom, NULL, NULL, NULL, NULL );
+    request->address.GetTranslatedAddress( &dbc, &dom, NULL, NULL, NULL, NULL );    
     
      /* 
      * Decide which access port will be used, based on the PortAccessPolicy.
@@ -816,23 +866,27 @@ bool SubArray::Shift( NVMainRequest *request )
     /* select port */
     ncounter_t port;
     
-    if( request->type == WRITE || request->type == WRITE_PRECHARGE )
-        port = 0;
-    else
-        port = FindClosestPort(dbc, dom );
+    // if( request->type == WRITE || request->type == WRITE_PRECHARGE )
+    //     port = 0;
+    // else
+    port = FindClosestPort(dbc, dom ); //All ports are RW ports
    
-//     std::cout<<"SA: DBC: "<<dbc<< "\tDomain: "<<dom << "\tand selected AP: "<<port<<std::endl;
+    // std::cout<<"SA: DBC: "<<dbc<< "\tDomain: "<<dom << "\tand time AP: "<<port<<std::endl;
     
-    numShifts = abs(rwPortPos[dbc][port] - dom); //absolute of (current position - new position). This gives number of shifts for a single bit
+    numShifts = abs(int(rwPortPos[dbc][port] - dom)); //absolute of (current position - new position). This gives number of shifts for a single bit
+
+    // std::cout << numShifts << std::endl;
+
+    // std::cout << "Shift" << std::endl;
         
     for( ncounter_t i = 0; i < nPorts; i++)
     {
       if( i != port)
       {
         if( rwPortPos[dbc][port] < int(dom) )
-            rwPortPos[dbc][i] += abs(rwPortPos[dbc][port] - dom);
+            rwPortPos[dbc][i] += abs(int(rwPortPos[dbc][port] - dom));
         else
-            rwPortPos[dbc][i] -= abs(rwPortPos[dbc][port] - dom);
+            rwPortPos[dbc][i] -= abs(int(rwPortPos[dbc][port] - dom));
       }
     }
     
@@ -851,6 +905,8 @@ bool SubArray::Shift( NVMainRequest *request )
     
     /* updated the total number of shifts */
     totalnumShifts += numShifts; 
+
+    numParallelShifts += numShifts/wordSize; // This metric is used to calculate shift latency, wordsize doesn't affect parallel shift.
     
     if( rwPortPos[dbc][port] > int(DOMAINS) ) //if port position is Invalid, display message and exit. note: negative is not checked because data type is unsigned.
     {	
@@ -900,6 +956,284 @@ bool SubArray::Shift( NVMainRequest *request )
     shiftReqs++;
     
     return true;
+}
+
+bool SubArray::Parallel( NVMainRequest *request ) {
+    
+    // Skyrmion insert adds a skyrmion inside a racetrack and shifts the remaining skyrmions
+    uint64_t dbc, dom;    
+    request->address.GetTranslatedAddress( &dbc, &dom, NULL, NULL, NULL, NULL );
+
+    if (p->MemIsSK && p->WordBasedMapping) {
+        ncounter_t numShifts = 0;
+        numShifts += wordSize * 2; //Shift bit by bit to write data, then back to stay word aligned
+        totalnumShifts += numShifts;      
+
+        if (p->ParallelPlusWrite) {
+
+        } else {
+
+        }
+    }
+
+
+    GetEventQueue( )->InsertEvent( EventResponse, this, request, 
+                    GetEventQueue()->GetCurrentCycle() + p->tIN);
+  
+    lastActivate = GetEventQueue()->GetCurrentCycle();
+
+    return true; // TODO
+}
+
+bool SubArray::Insert( NVMainRequest *request ) {
+    
+    // Skyrmion insert adds a skyrmion inside a racetrack and shifts the remaining skyrmions
+    uint64_t dbc, dom;    
+    request->address.GetTranslatedAddress( &dbc, &dom, NULL, NULL, NULL, NULL );
+
+    insertReqs++;
+    numInserts++;
+    totalnumInserts++;
+
+    if ( p->MemIsSK)
+    {
+        // Determine number of skyrmions created during insert
+        // Assume wordsize in bits, so shift through wordsize bits of old and new request
+
+        if ( p->WordBasedMapping) {
+            // Track is word-based, so wordsize is within one track.
+            ncounter_t numShifts = 0;
+            numShifts += wordSize * 2; //Shift bit by bit to write data, then back to stay word aligned
+            totalnumShifts += numShifts;                
+        }
+
+
+        for (uint32_t bit = 0; bit < wordSize; bit++) {
+            bool after = request->data.GetByte(bit / 8) & (0b1 << (bit % 8));
+
+            if (after) 
+            {
+                // If skyrmion will be written
+                numSkyrmionCreated++;
+            }
+        }            
+    }
+
+    GetEventQueue( )->InsertEvent( EventResponse, this, request, 
+                    GetEventQueue()->GetCurrentCycle() + p->tIN);
+  
+    lastActivate = GetEventQueue()->GetCurrentCycle();
+
+    return true; // TODO
+}
+
+bool SubArray::Lim( NVMainRequest *request ) {    
+    // Skyrmion insert adds a skyrmion inside a racetrack and shifts the remaining skyrmions
+    uint64_t dbc, dom;    
+    request->address.GetTranslatedAddress( &dbc, &dom, NULL, NULL, NULL, NULL );
+
+    limReqs++;
+
+    /**
+    * ###### Preparing LIM parameters #########    
+    */        
+    ncounter_t port = FindClosestPort(dbc, dom ); //Port is based on first LIM
+    uint32_t result_address = request->data.GetByte((wordSize / 8) + 0) << 24
+                            | request->data.GetByte((wordSize / 8) + 1) << 16
+                            | request->data.GetByte((wordSize / 8) + 2) << 8
+                            | request->data.GetByte((wordSize / 8) + 3) << 0;
+
+    // Only read mask if more than 1 LimDBCS
+    ncounter_t lim_mask = 0xFF;
+    if (p->LimDBCS > 1) {
+        lim_mask = request->data.GetByte((wordSize / 8) + 4);
+    }
+
+    // First destination track shift to destination address
+    uint64_t dbc_res = result_address >> 21; // TODO: Make variable
+    uint64_t dom_res = (result_address >> 6) & 0b111111111111111; // TODO: Make variable
+
+    // std::cout<< "Bitvector: DBC: "<<dbc<< "\tDomain: "<<dom << "        Res: DBC: "<< dbc_res << "\tDomain: " << dom_res <<std::endl;
+
+    ncounter_t longestShift = 0;
+    /**
+    * ###### End of LIM parameters #########    
+    */     
+
+
+    /**
+    * ###### Loop through each parallel LIM operation #########    
+    */     
+    for (ncounter_t j = 0; j < p->LimDBCS; j++) {
+        if (!((lim_mask & (1<<j)) && p->MemIsSK && wordSize == 32)) {
+            continue;
+        }
+
+        // std::cout<< "Bitvector: DBC: "<<dbc + j << "\tDomain: "<<dom << "        Res: DBC: "<< dbc_res + j << "\tDomain: " << dom_res <<std::endl;
+
+        /**
+        * ###### Shifting the Bitvectors track #########    
+        */   
+        numShifts = 0;    
+        numShifts = abs(int(rwPortPos[dbc + j][port] - dom));
+        for( ncounter_t i = 0; i < nPorts; i++)
+        {
+            if( i != port)
+            {
+                if( rwPortPos[dbc + j][port] < int(dom) )
+                    rwPortPos[dbc + j][i] += abs(int(rwPortPos[dbc + j][port] - dom));
+                else
+                    rwPortPos[dbc + j][i] -= abs(int(rwPortPos[dbc + j][port] - dom));
+            }
+        }    
+        
+        /* updated AP position based on the port update policy (eager/lazy) */   
+        if( LazyPortUpdate ) //update policy is set to lazy in the config file
+        {
+            numShifts *= wordSize;      //numShifts for the entire word
+            rwPortPos[dbc + j][port] = dom; //Update head position to the current position
+        }
+        else
+        {
+            numShifts *= wordSize * 2; //numShifts for the entire word. In the eager policy, 2x shifts are incurred (align and come back)
+            rwPortPos[dbc + j][port] = rwPortInitPos[dbc + j][port]; //Reset this port to the initial position
+        }
+        
+        /* updated the total number of shifts */
+        totalnumShifts += numShifts; 
+        
+        if ((numShifts / wordSize) > longestShift) {
+            longestShift = numShifts / wordSize;
+        }        
+
+        /**
+        * ###### End of Shifting the Bitvectors track #########    
+        */   
+
+        /**
+        * ###### Shifting the result track #########
+        */
+        numShifts = 0;
+        numShifts = abs(int(rwPortPos[dbc_res + j][port] - dom_res));
+
+        //Shift all ports
+        for( ncounter_t i = 0; i < nPorts; i++)
+        {
+        if( i != port)
+        {
+            if( rwPortPos[dbc_res + j][port] < int(dom_res) )
+                rwPortPos[dbc_res + j][i] += abs(int(rwPortPos[dbc_res + j][port] - dom_res));
+            else
+                rwPortPos[dbc_res + j][i] -= abs(int(rwPortPos[dbc_res + j][port] - dom_res));
+        }
+        }
+
+        /* updated AP position based on the port update policy (eager/lazy) */
+    
+        if( LazyPortUpdate ) //update policy is set to lazy in the config file
+        {
+            numShifts *= wordSize;      //numShifts for the entire word
+            rwPortPos[dbc_res + j][port] = dom_res; //Update head position to the current position
+        }
+        else
+        {
+            numShifts *= wordSize * 2; //numShifts for the entire word. In the eager policy, 2x shifts are incurred (align and come back)
+            rwPortPos[dbc_res + j][port] = rwPortInitPos[dbc_res + j][port]; //Reset this port to the initial position
+        }
+        
+        /* updated the total number of shifts */
+        totalnumShifts += numShifts; 
+        if ((numShifts / wordSize) > longestShift) {
+            longestShift = numShifts / wordSize;
+        }    
+        /**
+        * ###### Shifting the result track #########
+        */
+
+
+        if ((lim_mask & (1<<j)) && p->MemIsSK && wordSize == 32) {
+            // If mask enabled, enable shift operation
+            numLims++;
+            totalNumLims++;
+
+            for (uint32_t bit = 0; bit < wordSize; bit++) {
+                bool bitvector_bool = request->data.GetByte(bit / 8) & (0b1 << (bit % 8)); // Result bitvector value
+                bool resultvector_old_bool = request->oldData.GetByte((bit / 8) + (j * (4 + (wordSize / 8)))) & (0b1 << (bit % 8)); // Bitvector
+                
+                //Bitvector is first word after mask
+                // If skyrmions can be reused non are created or destroyed. 
+                if (!p->LimSkyrmionReuse) {                                 
+                    numSkyrmionCreated++;            
+                    if (!bitvector_bool && !resultvector_old_bool) {
+                        numSkyrmionDestroyed++;
+                    } 
+                    if (!bitvector_bool && resultvector_old_bool) {
+                        numSkyrmionDestroyed += 2;
+                    } 
+                    if (bitvector_bool && !resultvector_old_bool) {
+                        numSkyrmionDestroyed++;
+                    } 
+                    if (bitvector_bool && resultvector_old_bool) {
+                        numSkyrmionDestroyed++;
+                    }                                                             
+                }
+
+            }       
+        }    
+    }
+
+    // std::cout<< "Bitvector: DBC: "<<dbc<< "\tDomain: "<<dom << "        Res: DBC: "<< dbc_res << "\tDomain: " << dom_res << "         Longest shift " << longestShift << std::endl;
+
+    numParallelShifts += longestShift;
+
+    GetEventQueue( )->InsertEvent( EventResponse, this, request, 
+                    GetEventQueue()->GetCurrentCycle() + p->tLIM);
+  
+    lastActivate = GetEventQueue()->GetCurrentCycle();
+
+    return true; // TODO
+}
+
+bool SubArray::Delete( NVMainRequest *request ) {
+    
+    // Skyrmion delete removes a skyrmion and shifts the remaining racetrack to fill
+    uint64_t dbc, dom;
+    request->address.GetTranslatedAddress( &dbc, &dom, NULL, NULL, NULL, NULL );
+
+    deleteReqs++;
+    numDeletes++;
+    totalnumDeletes++;
+
+    if ( p->MemIsSK)
+    {
+        // Determine number of skyrmions created/deleted during writing
+        // Assume wordsize in bits, so shift through wordsize bits of old and new request
+
+        if ( p->WordBasedMapping) {
+            // Track is word-based, so wordsize is within one track.
+            ncounter_t numShifts = 0;
+            numShifts += wordSize; //Deleting one word
+            totalnumShifts += numShifts;                
+        }
+
+
+        for (uint32_t bit = 0; bit < wordSize; bit++) {
+            bool before = request->oldData.GetByte(bit / 8) & (0b1 << (bit % 8));
+
+            if(before) 
+            {                    
+                // If no skyrmion written, but one exists before
+                numSkyrmionDestroyed++;
+            }
+        }            
+    }
+
+    GetEventQueue( )->InsertEvent( EventResponse, this, request, 
+                    GetEventQueue()->GetCurrentCycle() + p->tDE);
+  
+    lastActivate = GetEventQueue()->GetCurrentCycle();    
+
+    return true; // TODO
 }
 
 
@@ -1341,6 +1675,10 @@ bool SubArray::IsIssuable( NVMainRequest *req, FailReason *reason )
     {
         /* We assume subarray can always shift, because ACTIVATE before this has been successfully performed. */
     }
+    else if( req->type == INSERT || req->type == DELETE || req->type == LIM || req->type == PARALLEL)
+    {
+        /* We assume subarray can always shift, because ACTIVATE before this has been successfully performed. */
+    }    
     else if( req->type == READ || req->type == READ_PRECHARGE )
     {
         if( nextRead > (GetEventQueue()->GetCurrentCycle()) /* if it is too early to read */
@@ -1439,6 +1777,18 @@ bool SubArray::IssueCommand( NVMainRequest *req )
             case SHIFT:
                 rv = this->Shift( req );
                 break;
+            case INSERT:
+                rv = this->Insert( req );
+                break;
+            case PARALLEL:
+                rv = this->Parallel( req );
+                break;
+            case DELETE:
+                rv = this->Delete( req );
+                break;
+            case LIM:
+                rv = this->Lim( req );
+                break;
 
             case READ:
             case READ_PRECHARGE:
@@ -1503,6 +1853,10 @@ bool SubArray::RequestComplete( NVMainRequest *req )
             /* may implement more functions in the future */
             case ACTIVATE:
             case SHIFT:
+            case INSERT:
+            case PARALLEL:
+            case DELETE:
+            case LIM:
             case READ:
             case WRITE:
                 delete req;
@@ -1773,15 +2127,15 @@ ncounter_t SubArray::FindClosestPort(uint64_t dbc, uint64_t domain)
   {
       AP = domain / ( DOMAINS / nPorts ); // As an example: if DOMAINS = 100, nPorts = 2 and domain = 53, AP = 1, if domain is < 50, AP will be set to 0  
    
-      // printf("Domains: %ld, currentDomain: %ld, DBC: %ld, Selected AP: %ld\n",DOMAINS, domain, dbc, AP);
+    //   printf("Domains: %ld, currentDomain: %ld, DBC: %ld, Selected AP: %ld\n",DOMAINS, domain, dbc, AP);
   }
   else
   {
-      int min = abs( rwPortPos[dbc][0] - domain );
+      int min = abs(int(rwPortPos[dbc][0] - domain ));
       for(uint16_t i = 1; i < nPorts; i++)
-        if( abs( rwPortPos[dbc][i] - domain ) < min )
+        if( abs(int(rwPortPos[dbc][i] - domain )) < min )
         {
-            min = abs( rwPortPos[dbc][i] - domain );
+            min = abs(int(rwPortPos[dbc][i] - domain ));
             AP = i;
         }
   }

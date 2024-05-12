@@ -311,6 +311,38 @@ bool StandardRank::Shift( NVMainRequest *request )
     return true;
 }
 
+bool StandardRank::Insert( NVMainRequest *request )
+{
+    /* issue INSERT to target bank */
+    GetChild( request )->IssueCommand( request );
+
+    return true;
+}
+
+bool StandardRank::Parallel (NVMainRequest *request)
+{
+    GetChild( request )->IssueCommand( request );
+
+    return true;
+}
+
+bool StandardRank::Delete( NVMainRequest *request )
+{
+    /* issue DELETE to target bank */
+    GetChild( request )->IssueCommand( request );
+
+    return true;
+}
+
+
+bool StandardRank::Lim( NVMainRequest *request )
+{
+    /* issue LIM to target bank */
+    GetChild( request )->IssueCommand( request );
+
+    return true;
+}
+
 bool StandardRank::Read( NVMainRequest *request )
 {
     uint64_t readBank;
@@ -536,6 +568,7 @@ bool StandardRank::CanPowerUp( NVMainRequest *request )
     }
 
     assert( issuableCount == 0 || issuableCount == GetChildren().size() );
+    (void) issuableCount;
 
     return issuable;
 }
@@ -637,7 +670,11 @@ ncycle_t StandardRank::NextIssuable( NVMainRequest *request )
     else if( request->type == READ || request->type == READ_PRECHARGE ) nextCompare = nextRead;
     else if( request->type == WRITE || request->type == WRITE_PRECHARGE ) nextCompare = nextWrite;
     else if( request->type == PRECHARGE || request->type == PRECHARGE_ALL ) nextCompare = nextPrecharge;
-    else assert(false);
+    else if( request->type == SHIFT || request->type == INSERT || request->type == DELETE || request->type == LIM || request->type == PARALLEL) nextCompare = nextRead; // TODO
+    else {
+        std::cerr << "Invalid request type << " << request->type << std::endl;
+        assert(false);
+    };
         
     return MAX(GetChild( request )->NextIssuable( request ), nextCompare );
 }
@@ -695,6 +732,10 @@ bool StandardRank::IsIssuable( NVMainRequest *req, FailReason *reason )
     {
         rv = GetChild( req )->IsIssuable( req, reason );
     }
+    else if( req->type == INSERT || req->type == DELETE || req->type == LIM || req->type == PARALLEL)
+    {
+        rv = GetChild( req )->IsIssuable( req, reason );
+    }    
     else if( req->type == READ || req->type == READ_PRECHARGE )
     {
         if( nextRead > GetEventQueue( )->GetCurrentCycle( ) )
@@ -811,7 +852,20 @@ bool StandardRank::IssueCommand( NVMainRequest *req )
             case SHIFT:
                 rv = this->Shift( req );
                 break;
-                
+
+            case INSERT:
+                rv = this->Insert( req );
+                break;                
+            case DELETE:
+                rv = this->Delete( req );
+                break;
+            case LIM:
+                rv = this->Lim (req );
+                break;
+            case PARALLEL:
+                rv = this->Parallel( req );
+                break;
+
             case READ:
             case READ_PRECHARGE:
                 rv = this->Read( req );
